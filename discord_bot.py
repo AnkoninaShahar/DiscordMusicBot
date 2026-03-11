@@ -250,7 +250,7 @@ async def set_loop(interaction: discord.Interaction, enable: bool):
     await interaction.response.send_message(f"Looping is now {'enabled' if enable else 'disabled'}")
 
 """
-Command to display the current playlist queue. It checks if there are songs in the queue for the
+Command to display the current playlist queue.
 
 Args:
     interaction: The Discord interaction object representing the command invocation.
@@ -258,7 +258,7 @@ Args:
 @bot.tree.command(name="queuelist", description="Displays the current playlist.")
 async def print_queue(interaction: discord.Interaction):
     guild_id = str(interaction.guild_id)
-    
+
     # Check if there are songs in the queue for the guild. 
     # If there are, construct a message listing the titles of the songs in the queue. 
     if SONG_QUEUES.get(guild_id):
