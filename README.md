@@ -4,7 +4,7 @@
 
 ---
 ## About
-A discord bot that acts as a music player on a discord call. Users can use / commands to play, queue, skip, stop, pause, or resume music. This allows a group of people to listen to the same songs at the same time.
+A discord bot that acts as a music player on a discord call. Users can use / commands to play, queue, skip, stop, pause, resume, or loop music. This allows a group of people to listen to the same songs at the same time.
 
 ---
 ## Features
@@ -14,6 +14,7 @@ A discord bot that acts as a music player on a discord call. Users can use / com
 - *Stop:* Stops the bot entirely and causes it to quit the call.
 - *Pause:* Pauses the audio currently playing.
 - *Resume:* Resumes any paused audio.
+- *Loop:* Loops the current queue
 
 ---
 ## Tech Stack
