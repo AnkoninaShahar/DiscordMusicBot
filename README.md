@@ -27,10 +27,10 @@ Follow these steps to run the project locally:
 
 ```bash
 # Clone the repo
-git clone https://github.com/AnkoninaShahar/DiscordBot.git
+git clone https://github.com/AnkoninaShahar/DiscordMusicBot.git
 
 # Navigate into the directory
-cd DiscordBot
+cd DiscordMusicBot
 
 # Install dependencies (Python example)
 pip install -r requirements.txt

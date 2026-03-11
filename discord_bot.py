@@ -1,7 +1,16 @@
+"""
+Discord bot that can play audio from YouTube links or search queries. Uses yt-dlp to extract audio URLs and FFmpeg for streaming.
+Commands:
+- /play [song_query]: Plays the specified song or adds it to the queue.
+- /pause: Pauses the currently playing audio.
+- /resume: Resumes paused audio.
+- /skip: Skips the currently playing song.
+- /stop: Stops playback and clears the queue.
+- /loop [enable]: Toggles looping of the current playlist on or off.
+"""
 import os
-import logging  # Added so we can surface interaction/voice issues in the console.
+import logging 
 import discord
-from discord.abc import Connectable  # Gives us a protocol for any connectable voice target (stage/voice channel).
 from discord.ext import commands
 from discord import app_commands
 from dotenv import load_dotenv
@@ -10,293 +19,276 @@ import asyncio
 from collections import deque
 
 load_dotenv()
-TOKEN = os.getenv("DISCORD_TOKEN")
+TOKEN = os.getenv("DISCORD_TOKEN") # Make sure to set this in your .env file.
 
-GUILD_ID = 820497690609713153
+GUILD_ID = None # Set this to the ID of your server if you want to limit the bot to a single server. Otherwise, set to None and it will work in any server it's invited to.
 
-SONG_QUEUES = {}  # Per-guild FIFO queues so music continues even when multiple requests overlap.
-PLAY_LOCKS = {}  # Per-guild asyncio locks to serialize queue/voice mutations and avoid race conditions.
-VOICE_CHANNELS = {}  # Tracks the channel each guild last requested so reconnects know where to go.
-LOGGER = logging.getLogger("discord_bot")  # Shared logger for interaction/voice diagnostics.
+SONG_QUEUES = {} # Dictionary to hold song queues for each guild, keyed by guild ID.
+LOOP_STATES = {}  # Set to True to enable looping of the current playlist, keyed by guild ID.
 
+"""
+Helper function to run yt-dlp extraction in a non-blocking way using asyncio's run_in_executor. This allows the bot to remain responsive while fetching video information.
 
-async def send_interaction_message(
-    interaction: discord.Interaction,
-    *,
-    content: str,
-    ephemeral: bool = False,
-    force_followup: bool = False,
-):
-    """Send a response or followup depending on whether the interaction already has an initial response."""
-    # `force_followup` lets callers skip the auto-detection when they know the interaction was already deferred.
-    # Handles the Discord rule that an interaction can only be acknowledged once.
-    use_followup = force_followup or interaction.response.is_done()
-    try:
-        use_followup = force_followup or interaction.response.is_done()
-        if use_followup:
-            await interaction.followup.send(content, ephemeral=ephemeral)
-        else:
-            await interaction.response.send_message(content, ephemeral=ephemeral)
-    except discord.HTTPException as exc:
-        if exc.code == 40060 and not use_followup:
-            # Response already acknowledged elsewhere; fall back to followup.
-            try:
-                await interaction.followup.send(content, ephemeral=ephemeral)
-            except discord.DiscordException as followup_exc:
-                LOGGER.warning("Could not send followup (code=%s): %s", getattr(followup_exc, "code", "n/a"), followup_exc)
-        else:
-            LOGGER.warning("Failed to send interaction message (code=%s): %s", exc.code, exc)
-    except discord.NotFound:
-        LOGGER.warning("Interaction expired before a response could be sent.")
-
-
-async def defer_interaction(interaction: discord.Interaction) -> bool:
-    """Attempt to defer the interaction, returning False if it no longer exists."""
-    # Centralizes defer logic so we can gracefully handle expired interactions.
-    if interaction.response.is_done():
-        return True
-    try:
-        await interaction.response.defer(thinking=True)
-        return True
-    except discord.NotFound:
-        LOGGER.warning("Interaction expired before defer() could be called.")
-        return False
-    except discord.DiscordException as exc:
-        LOGGER.error("Failed to defer interaction (code=%s): %s", getattr(exc, "code", "n/a"), exc)
-        return False
-
+Args:
+    query: The search query or URL to extract information from.
+    ydl_opts: Options to pass to yt-dlp for extraction.
+Returns:
+    The extracted information from yt-dlp.
+"""
 async def search_ytdlp_async(query, ydl_opts):
-    loop = asyncio.get_running_loop()
-    return await loop.run_in_executor(None, lambda: _extract(query, ydl_opts))
+    loop = asyncio.get_running_loop() # Get the current event loop to run the blocking yt-dlp extraction in a separate thread.
+    return await loop.run_in_executor(None, lambda: _extract(query, ydl_opts)) # Run the _extract function in a separate thread to avoid blocking the main event loop.
 
+"""
+Helper function to perform the actual yt-dlp extraction. This is run in a separate thread to avoid blocking the main event loop.
+
+Args:
+    query: The search query or URL to extract information from.
+    ydl_opts: Options to pass to yt-dlp for extraction.
+
+Returns:
+    The extracted information from yt-dlp.
+"""
 def _extract(query, ydl_opts):
+    # Use yt-dlp to extract information based on the provided query and options. 
+    # The download=False option tells yt-dlp not to download the video, but just to extract the information.
     with yt_dlp.YoutubeDL(ydl_opts) as ydl:
         return ydl.extract_info(query, download=False)
 
-
-async def ensure_voice_client(guild: discord.Guild, target_channel: Connectable) -> discord.VoiceClient:
-    """Connect or move the bot to the desired voice channel, retrying on transient voice gateway errors."""
-    # Guarantees the bot is in the right channel before dequeueing audio, even after Discord drops the connection.
-    if target_channel is None:
-        raise RuntimeError("No target voice channel recorded for this guild.")
-
-    voice_client = guild.voice_client
-    if voice_client and voice_client.channel == target_channel:
-        if voice_client.is_connected():
-            return voice_client
-
-        # Allow discord.py's internal reconnection logic a brief window to finish before forcing a reconnect.
-        try:
-            reconnect_wait = await asyncio.wait_for(
-                asyncio.to_thread(voice_client.wait_until_connected, 5.0),
-                timeout=6.0,
-            )
-        except Exception:
-            reconnect_wait = False
-
-        if reconnect_wait:
-            return voice_client
-
-    last_exception = None
-    for attempt in range(3):
-        # Retry a few times because Discord occasionally closes the voice gateway with code 4006 mid-handshake.
-        try:
-            voice_client = guild.voice_client
-            if voice_client is None:
-                voice_client = await target_channel.connect(reconnect=True)
-            elif voice_client.channel != target_channel:
-                await voice_client.move_to(target_channel, reconnect=True)
-            elif not voice_client.is_connected():
-                await voice_client.disconnect(force=True)
-                voice_client = await target_channel.connect(reconnect=True)
-            return voice_client
-        except discord.errors.ConnectionClosed as exc:
-            last_exception = exc
-            LOGGER.warning(
-                "Voice gateway closed with code %s while connecting to %s (attempt %s/3).",
-                exc.code,
-                target_channel.id,
-                attempt + 1,
-            )
-            await asyncio.sleep(1)
-        except discord.DiscordException as exc:
-            last_exception = exc
-            LOGGER.error("Voice connect/move failed on attempt %s: %s", attempt + 1, exc)
-            await asyncio.sleep(1)
-
-    if last_exception:
-        raise last_exception
-    raise RuntimeError("Unable to establish a voice connection.")
-
-intents = discord.Intents.default()
+# Sets ups the intents for the bot
+intents = discord.Intents.default() 
 intents.message_content = True
-
 bot = commands.Bot(command_prefix="!", intents=intents)
 
+""" Event handler that is called when the bot is ready. It syncs the command tree with the specified guild (if GUILD_ID is set) and prints a message to the console. """
 @bot.event
 async def on_ready():
-    test_guild = discord.Object(id=GUILD_ID)
-    await bot.tree.sync(guild=test_guild)
+    # If GUILD_ID is set, sync the command tree to that specific guild for faster command registration. 
+    # Otherwise, it will be registered globally, which can take up to an hour to propagate.
+    if GUILD_ID is not None:
+        test_guild = discord.Object(id=GUILD_ID)
+        await bot.tree.sync(guild=test_guild)
+    else:
+        await bot.tree.sync()
     print(f"{bot.user} is online")
 
+# Uncomment this if you want to see the guild ID of messages for debugging purposes.
 # @bot.event 
 # async def on_message(msg):
 #     print(msg.guild.id)
 
+"""
+Command to play audio based on a search query. It checks if the user is in a voice channel, connects to it if necessary, and uses yt-dlp to search for the song. 
+The audio URL is then added to the queue, and if nothing is currently playing, it starts playback immediately.
+
+Args:
+    interaction: The Discord interaction object representing the command invocation.
+    song_query: The search query for the song to play.
+"""
 @bot.tree.command(name="play", description="Plays audio or add it to the queue.")
 @app_commands.describe(song_query="Search query")
 async def play(interaction: discord.Interaction, song_query: str):
     try:
-        interaction_deferred = False  # Tracks whether we already sent a defer so later replies use followups.
-        voice_state = interaction.user.voice  # Capture the caller's voice channel for validation/reconnects.
-        if voice_state is None or voice_state.channel is None:
-            await send_interaction_message(interaction, content="You must be in a voice channel.", ephemeral=True)
+        await interaction.response.defer() # Defer the response to allow time for processing
+
+        voice_channel = interaction.user.voice.channel
+
+        # Check if the user is in a voice channel
+        if voice_channel is None:
+            await interaction.followup.send("You must be in a voice channel.")
             return
 
-        interaction_deferred = await defer_interaction(interaction)
-        if not interaction_deferred:
-            # Interaction is no longer valid; nothing we can do.
-            return
+        voice_client = interaction.guild.voice_client
 
+        # Connect to the voice channel if not already connected, or move if connected to a different channel
+        if voice_client is None:
+            voice_client = await voice_channel.connect()
+        elif voice_channel != voice_client.channel:
+            await voice_client.move_to(voice_channel)
+
+        # Set up yt-dlp options for extracting audio information. 
+        # These options specify that we want the best audio format, no playlists, and to suppress output and warnings.
         ydl_options = {
-            "format": "bestaudio[abr<=96]/bestaudio",
+            "format": "bestaudio/best",
             "noplaylist": True,
-            "youtube_include_dash_manifest": False,
-            "youtube_include_hls_manifest": False,
+            "quiet": True,
+            "no_warnings": True,
+            "source_address": "0.0.0.0", 
+            "extractor_args": {
+                "youtube": {
+                    "player_client": ["android", "web_creator"],
+                    "player_skip": ["webpage", "configs"],
+                }
+            },
         }
 
+        # Use yt-dlp to search for the song based on the provided query. 
+        # The "ytsearch1:" prefix tells yt-dlp to perform a search and return the first result.
         query = "ytsearch1: " + song_query
         results = await search_ytdlp_async(query, ydl_options)
         tracks = results.get("entries", [])
 
-        if not tracks:
-            await send_interaction_message(
-                interaction,
-                content="No results found.",
-                ephemeral=True,
-                force_followup=interaction_deferred,
-            )
+        # Check if any tracks were found. If not, send a message to the user indicating that no results were found.
+        if tracks is None:
+            await interaction.followup.send("No results found.")
             return
 
+        # Get the first track from the search results and extract the audio URL and title. 
+        # The title is used for display purposes in the queue and now playing messages.
         first_track = tracks[0]
         audio_url = first_track["url"]
         title = first_track.get("title", "Untitled")
 
+        # Add the audio URL and title to the queue for the guild. If there is no existing queue for the guild, a new deque is created to hold the songs.
         guild_id = str(interaction.guild_id)
-        lock = PLAY_LOCKS.setdefault(guild_id, asyncio.Lock())
-        start_playback = False  # Indicates whether this request should start playback or just enqueue.
-        voice_client = None
-        VOICE_CHANNELS[guild_id] = voice_state.channel  # Remember the caller's channel for future reconnect attempts.
-        async with lock:
-            voice_client = await ensure_voice_client(interaction.guild, voice_state.channel)
+        if SONG_QUEUES.get(guild_id) is None:
+            SONG_QUEUES[guild_id] = deque()
 
-            queue = SONG_QUEUES.setdefault(guild_id, deque())
-            queue.append((audio_url, title))
-            if not (voice_client.is_playing() or voice_client.is_paused()):
-                start_playback = True
+        SONG_QUEUES[guild_id].append((audio_url, title)) # Add the audio URL and title as a tuple to the end of the queue for the guild.
 
-        if start_playback:
-            await send_interaction_message(
-                interaction,
-                content=f"Now playing: **{title}**",
-                force_followup=interaction_deferred,
-            )
-            await play_next_song(voice_client, guild_id, interaction.channel)
+        # If there is currently audio playing or paused, send a message indicating that the song was added to the queue. 
+        # Otherwise, start playback immediately and send a message indicating that the song is now playing.
+        if voice_client.is_playing() or voice_client.is_paused():
+            await interaction.followup.send(f"Added to queue: **{title}**")
         else:
-            await send_interaction_message(
-                interaction,
-                content=f"Added to queue: **{title}**",
-                force_followup=interaction_deferred,
-            )
+            await interaction.followup.send(f"Now playing: **{title}**")
+            await play_next_song(voice_client, guild_id, interaction.channel)
     except Exception as e:
-        await send_interaction_message(
-            interaction,
-            content=f"Error: {e}",
-            ephemeral=True,
-            force_followup=interaction.response.is_done(),
-        )
+        # Log the exception with a message to help identify where the error occurred. 
+        # This will print the stack trace to the console, which can be helpful for debugging.
+        logging.exception(f"Error in play command: {e}")
+        await interaction.followup.send("An error occurred while trying to play the audio. Try again later.")
 
+""" 
+Command to pause the currently playing audio. It checks if there is an active voice client and if it is currently playing audio before pausing. 
 
+Args:
+    interaction: The Discord interaction object representing the command invocation.
+"""
 @bot.tree.command(name="pause", description="Pauses the audio.")
 async def pause(interaction: discord.Interaction):
     voice_client = interaction.guild.voice_client
+
+    # Check if there is an active voice client and if it is currently playing audio before pausing. 
+    # If there is no audio playing, send a message to the user indicating that there is nothing to pause.
     if voice_client and voice_client.is_playing():
         voice_client.pause()
         await interaction.response.send_message("Pausing audio...")
     else:
         await interaction.response.send_message("No audio is playing")
 
+""" 
+Command to resume paused audio. It checks if there is an active voice client and if it is currently paused before resuming. 
+
+Args:
+    interaction: The Discord interaction object representing the command invocation.
+"""
 @bot.tree.command(name="resume", description="Resumes the audio.")
 async def resume(interaction: discord.Interaction):
     voice_client = interaction.guild.voice_client
+
+    # Check if there is an active voice client and if it is currently paused before resuming.
     if voice_client and voice_client.is_paused():
         voice_client.resume()
         await interaction.response.send_message("Resuming audio...")
     else:
         await interaction.response.send_message("No audio is paused")
 
+"""
+Command to skip the currently playing song. It checks if there is an active voice client and if it is currently playing or paused before 
+stopping the current audio, which triggers the next song in the queue to play.
+
+Args:
+    interaction: The Discord interaction object representing the command invocation.
+"""
 @bot.tree.command(name="skip", description="Skips the song currently playing.")
 async def skip(interaction: discord.Interaction):
     voice_client = interaction.guild.voice_client
+
+    # Check if there is an active voice client and if it is currently playing or paused before stopping the current audio.
     if voice_client and (voice_client.is_playing() or voice_client.is_paused()):
         voice_client.stop()
         await interaction.response.send_message("Skipped the current song")
     else:
         await interaction.response.send_message("No audio is playing")
-        
+
+"""
+Command to stop playback and clear the queue. It checks if there is an active voice client and if it is currently playing or paused before 
+stopping the audio, clearing the queue, and disconnecting from the voice channel.
+
+Args:
+    interaction: The Discord interaction object representing the command invocation.
+"""
 @bot.tree.command(name="stop", description="Stops the bot.")
 async def stop(interaction: discord.Interaction):
     voice_client = interaction.guild.voice_client
+
+    # Check if there is an active voice client and if it is currently playing or paused before stopping the audio, clearing the queue, and disconnecting from the voice channel.
     if voice_client:
+        guild_id = str(interaction.guild_id)
+        voice_client.stop()
         voice_client.disconnect()
-        SONG_QUEUES[str(interaction.guild_id)] = deque()
+        SONG_QUEUES[guild_id] = deque()
         await interaction.response.send_message("Stopping...")
     else:
-        await interaction.response.send_message("There's nothing to stop")
+        await interaction.response.send_message("No audio is playing.")
 
+"""
+Command to toggle looping of the current playlist queue on or off. When enabled, the current song will be re-added to the end of the queue after it finishes playing, creating a loop effect.
+
+Args:
+    interaction: The Discord interaction object representing the command invocation.
+    enable: A boolean parameter that determines whether looping should be enabled (True) or disabled (False).
+"""
+@bot.tree.command(name="loop", description="Loops the current playlist when enabled.")
+@app_commands.describe(enable="Enable or disable looping (True/False)")
+async def set_loop(interaction: discord.Interaction, enable: bool):
+    # Store the looping state for the guild in the LOOP_QUEUES dictionary, keyed by guild ID. 
+    # This allows us to check the looping state when a song finishes playing and decide whether to re-add it to the queue.
+    guild_id = str(interaction.guild_id)
+    LOOP_STATES[guild_id] = enable
+    await interaction.response.send_message(f"Looping is now {'enabled' if enable else 'disabled'}")
+
+"""
+Helper function to play the next song in the queue. It checks if looping is enabled and re-adds the current song to the end of the queue if it is.
+
+Args:
+    voice_client: The active voice client to use for playback.
+    guild_id: The ID of the guild for which to play the next song.
+    channel: The text channel to send playback notifications to.
+"""
 async def play_next_song(voice_client, guild_id, channel):
-    lock = PLAY_LOCKS.setdefault(guild_id, asyncio.Lock())
-    async with lock:
-        queue = SONG_QUEUES.setdefault(guild_id, deque())
-        target_voice_channel = VOICE_CHANNELS.get(guild_id)
-        guild = getattr(channel, "guild", None) or bot.get_guild(int(guild_id))
-        if guild is None:
-            LOGGER.warning("Cannot resolve guild from channel; aborting playback.")
-            return
-        if target_voice_channel is None:
-            LOGGER.warning("No voice channel recorded for guild %s; aborting playback.", guild_id)
-            return
+    # Check if there are songs in the queue for the guild. If there are, play the next song. 
+    # If looping is enabled, re-add the current song to the end of the queue before playing the next one.
+    if SONG_QUEUES[guild_id]:
+        audio_url, title = SONG_QUEUES[guild_id].popleft()
 
-        try:
-            voice_client = await ensure_voice_client(guild, target_voice_channel)
-        except Exception as exc:
-            LOGGER.error("Unable to ensure voice client for guild %s: %s", guild_id, exc)
-            return
+        if LOOP_STATES[guild_id]:
+            SONG_QUEUES[guild_id].append((audio_url, title)) # Re-add the current song to the end of the queue if looping is enabled.
 
-        if voice_client.is_playing() or voice_client.is_paused():
-            return
+        # Set up FFmpeg options for streaming the audio.
+        ffmpeg_options = {
+            "before_options": "-reconnect 1 -reconnect_streamed 1 -reconnect_delay_max 5 -reconnect_on_network_error 1",
+            "options": "-vn",
+        }
 
-        if queue:
-            audio_url, title = queue.popleft()
+        # Create a new FFmpegOpusAudio source using the extracted audio URL and the specified options. 
+        # The executable path is set to the location of the FFmpeg binary.
+        source = discord.FFmpegOpusAudio(audio_url, **ffmpeg_options, executable="bin\\ffmpeg\\ffmpeg.exe")
 
-            ffmpeg_options = {
-                "before_options": "-reconnect 1 -reconnect_streamed 1 -reconnect_delay_max 5",
-                "options": "-vn -c:a libopus -b:a 96k",
-            }
+        # Define a callback function to be called after the current song finishes playing. 
+        # This function checks for errors and then calls play_next_song again to play the next song in the queue.
+        def after_play(error):
+            if error:
+                print(f"Error playing {title}: {error}")
+            asyncio.run_coroutine_threadsafe(play_next_song(voice_client, guild_id, channel), bot.loop)
 
-            source = discord.FFmpegOpusAudio(audio_url, **ffmpeg_options, executable="bin\\ffmpeg\\ffmpeg.exe")
+        # Start playing the audio source using the voice client and set the after_play function as the callback to be called when the audio finishes.
+        voice_client.play(source, after=after_play)
+        asyncio.create_task(channel.send(f"Now playing: **{title}**"))
+    else:
+        # If the queue is empty after the current song finishes, disconnect from the voice channel and clear the queue for the guild.
+        await voice_client.disconnect()
+        SONG_QUEUES[guild_id] = deque()
 
-            def after_play(error):
-                if error:
-                    print(f"Error playing {title}: {error}")
-                asyncio.run_coroutine_threadsafe(play_next_song(voice_client, guild_id, channel), bot.loop)
-
-            voice_client.play(source, after=after_play)
-            asyncio.create_task(channel.send(f"Now playing: **{title}**"))
-        else:
-            if voice_client.is_connected():
-                await voice_client.disconnect()
-            SONG_QUEUES[guild_id] = deque()
-            VOICE_CHANNELS.pop(guild_id, None)  # Drop stale channel data once the queue is empty.
-
-bot.run(TOKEN)
+bot.run(TOKEN) # Runs bot using TOKEN from .env file.
