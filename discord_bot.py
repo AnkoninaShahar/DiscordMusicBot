@@ -21,7 +21,7 @@ from collections import deque
 load_dotenv()
 TOKEN = os.getenv("DISCORD_TOKEN") # Make sure to set this in your .env file.
 
-GUILD_ID = None # Set this to the ID of your server if you want to limit the bot to a single server. Otherwise, set to None and it will work in any server it's invited to.
+GUILD_ID = 820497690609713153 # Set this to the ID of your server if you want to limit the bot to a single server. Otherwise, set to None and it will work in any server it's invited to.
 
 SONG_QUEUES = {} # Dictionary to hold song queues for each guild, keyed by guild ID.
 LOOP_STATES = {}  # Set to True to enable looping of the current playlist, keyed by guild ID.
@@ -250,6 +250,26 @@ async def set_loop(interaction: discord.Interaction, enable: bool):
     await interaction.response.send_message(f"Looping is now {'enabled' if enable else 'disabled'}")
 
 """
+Command to display the current playlist queue. It checks if there are songs in the queue for the
+
+Args:
+    interaction: The Discord interaction object representing the command invocation.
+"""
+@bot.tree.command(name="queuelist", description="Displays the current playlist.")
+async def print_queue(interaction: discord.Interaction):
+    guild_id = str(interaction.guild_id)
+    
+    # Check if there are songs in the queue for the guild. 
+    # If there are, construct a message listing the titles of the songs in the queue. 
+    if SONG_QUEUES.get(guild_id):
+        queue = ""
+        for url, title in SONG_QUEUES[guild_id]:
+            queue += f"- **{title}**\n"
+        await interaction.response.send_message("*Queue:*\n-----\n" + queue)
+    else:
+        await interaction.response.send_message("The queue is currently empty.")
+
+"""
 Helper function to play the next song in the queue. It checks if looping is enabled and re-adds the current song to the end of the queue if it is.
 
 Args:
@@ -263,7 +283,7 @@ async def play_next_song(voice_client, guild_id, channel):
     if SONG_QUEUES[guild_id]:
         audio_url, title = SONG_QUEUES[guild_id].popleft()
 
-        if LOOP_STATES[guild_id]:
+        if LOOP_STATES.get(guild_id) and LOOP_STATES[guild_id]:
             SONG_QUEUES[guild_id].append((audio_url, title)) # Re-add the current song to the end of the queue if looping is enabled.
 
         # Set up FFmpeg options for streaming the audio.
