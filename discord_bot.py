@@ -21,7 +21,7 @@ from collections import deque
 load_dotenv()
 TOKEN = os.getenv("DISCORD_TOKEN") # Make sure to set this in your .env file.
 
-GUILD_ID = 820497690609713153 # Set this to the ID of your server if you want to limit the bot to a single server. Otherwise, set to None and it will work in any server it's invited to.
+GUILD_ID = None # Set this to the ID of your server if you want to limit the bot to a single server. Otherwise, set to None and it will work in any server it's invited to.
 
 SONG_QUEUES = {} # Dictionary to hold song queues for each guild, keyed by guild ID.
 LOOP_STATES = {}  # Set to True to enable looping of the current playlist, keyed by guild ID.
